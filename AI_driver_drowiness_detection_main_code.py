@@ -29,8 +29,12 @@ PERCLOS_LIMIT = 15.0
 # BUZZER (Matek DBuz5V on GPIO17, driven via external transistor)
 BUZZER_PIN = 17
 BEEP_PULSE_MS = 8.0    # tunable live; a common-emitter stage may need more
-WARN_INTERVAL = 1.00   # one click per second
-CRIT_INTERVAL = 0.12   # rapid clicking
+CRIT_INTERVAL = 0.12   # rapid clicking while eyes are actually closed
+# Fatigue is advisory, not an emergency: a short burst on a long cooldown.
+# Continuous alerting at the wheel startles and gets tuned out.
+WARN_BURST = 2         # clicks per reminder
+WARN_REPEAT_S = 420.0  # ~7 min between reminders
+last_warn_time = 0.0
 BUZZER_ACTIVE_HIGH = False  # transistor stage inverts: GPIO low = sound
 alert_level = "OK"
 test_beep_request = False
@@ -139,7 +143,7 @@ def click(dev):
 
 def beeper_loop(dev):
     # Runs off the frame loop so pulse width is not quantised to the frame period.
-    global test_beep_request, hold_request
+    global test_beep_request, hold_request, last_warn_time
     while True:
         if hold_request:
             hold_request = False
@@ -154,7 +158,12 @@ def beeper_loop(dev):
         if level == "CRITICAL":
             click(dev); time.sleep(CRIT_INTERVAL)
         elif level == "WARNING":
-            click(dev); time.sleep(WARN_INTERVAL)
+            if time.time() - last_warn_time >= WARN_REPEAT_S:
+                last_warn_time = time.time()
+                for i in range(WARN_BURST):
+                    click(dev)
+                    if i < WARN_BURST - 1: time.sleep(0.20)
+            time.sleep(0.20)
         else:
             set_buzzer(dev, False); time.sleep(0.05)
 
