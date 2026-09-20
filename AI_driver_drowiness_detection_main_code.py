@@ -1,6 +1,5 @@
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import time
 import psutil
@@ -45,25 +44,26 @@ yawn_timestamps = deque()
 blink_timestamps = deque()
 per_window = deque(maxlen=1200)
 
-# 2. MATH HELPERS
-mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5)
+# 2. HAAR CASCADE CLASSIFIERS
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
-LEFT_EYE = [33, 160, 158, 133, 153, 144]; RIGHT_EYE = [362, 385, 387, 263, 373, 380]; MOUTH = [78, 308, 13, 14]
+def calculate_eye_ratio(eye_region):
+    gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY) if len(eye_region.shape) == 3 else eye_region
+    _, thresh = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY)
+    h, w = thresh.shape
+    top_half = thresh[:h//2, :]
+    bottom_half = thresh[h//2:, :]
+    top_white = np.sum(top_half == 255)
+    bottom_white = np.sum(bottom_half == 255)
+    total_white = top_white + bottom_white
+    return top_white / (total_white + 1)
 
-def get_distance(p1, p2): return np.linalg.norm(np.array(p1) - np.array(p2))
-
-def calculate_ear(landmarks, eye_indices, w, h):
-    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in eye_indices]
-    v1 = get_distance(pts[1], pts[5]); v2 = get_distance(pts[2], pts[4]); hor = get_distance(pts[0], pts[3])
-    return (v1 + v2) / (2.0 * hor) if hor > 0 else 0
-
-def calculate_mar(landmarks, mouth_indices, w, h):
-    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in mouth_indices]
-    ver = get_distance(pts[2], pts[3]); hor = get_distance(pts[0], pts[1])
-    return ver / hor if hor > 0 else 0
+def calculate_mouth_ratio(mouth_region):
+    gray = cv2.cvtColor(mouth_region, cv2.COLOR_BGR2GRAY) if len(mouth_region.shape) == 3 else mouth_region
+    _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+    h, w = thresh.shape
+    return np.sum(thresh == 255) / (h * w + 1)
 
 def get_pi_temp():
     try:
@@ -252,39 +252,57 @@ def main():
             frame = cv2.resize(frame, (w, h)) 
         
         frame = cv2.flip(frame, 1); h, w, _ = frame.shape
-        results = face_mesh.process(frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
         cur_ear = 0.0; cur_mar = 0.0; status = "OK"
 
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
-                cur_ear = calculate_ear(face_landmarks.landmark, LEFT_EYE, w, h)
-                cur_mar = calculate_mar(face_landmarks.landmark, MOUTH, w, h)
-                per_window.append(1 if cur_ear < EAR_THRESHOLD else 0)
-                per_score = round((sum(per_window)/len(per_window))*100, 1) if len(per_window)>0 else 0.0
+        if len(faces) > 0:
+            x, y, fw, fh = faces[0]
+            face_roi = frame[y:y+fh, x:x+fw]
+            face_gray = gray[y:y+fh, x:x+fw]
 
-                if cur_ear < EAR_THRESHOLD:
-                    closed_eyes_counter += 1
-                    if closed_eyes_counter >= 3 and not blink_active: blink_timestamps.append(now); blink_active = True
-                else: blink_active = False; closed_eyes_counter = 0
+            eyes = eye_cascade.detectMultiScale(face_gray)
 
-                if cur_mar > MAR_THRESHOLD:
-                    if not yawn_active: yawn_timestamps.append(now); yawn_active = True
-                else: yawn_active = False
-                
-                while blink_timestamps and now - blink_timestamps[0] > FATIGUE_WINDOW: blink_timestamps.popleft()
-                while yawn_timestamps and now - yawn_timestamps[0] > FATIGUE_WINDOW: yawn_timestamps.popleft()
-                current_bpm = round(len(blink_timestamps) / (FATIGUE_WINDOW / 60), 1)
+            cur_ear = 0.0
+            if len(eyes) >= 2:
+                eye_regions = [face_roi[ey:ey+eh, ex:ex+ew] for ex, ey, ew, eh in eyes[:2]]
+                eye_ratios = [calculate_eye_ratio(eye_reg) for eye_reg in eye_regions]
+                cur_ear = np.mean(eye_ratios)
 
-                if closed_eyes_counter >= ALARM_FRAMES:
-                    status = "CRITICAL: SLEEPING"; buzzer.on()
-                elif per_score >= PERCLOS_LIMIT or current_bpm >= BLINK_LIMIT_BPM or len(yawn_timestamps) >= YAWN_LIMIT:
-                    status = "WARNING: FATIGUE"; buzzer.on() if int(now * 3) % 2 == 0 else buzzer.off()
-                else: buzzer.off()
+            cur_mar = 0.0
+            mouth_y_start = int(fh * 0.6)
+            mouth_region = face_roi[mouth_y_start:, :]
+            if mouth_region.size > 0:
+                cur_mar = calculate_mouth_ratio(mouth_region)
 
-                if stream_active:
-                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    mp_drawing.draw_landmarks(bgr, face_landmarks, mp_face_mesh.FACEMESH_CONTOURS, None, mp_drawing_styles.get_default_face_mesh_contours_style())
-                    _, buf = cv2.imencode('.jpg', bgr); latest_jpeg = buf.tobytes()
+            per_window.append(1 if cur_ear < EAR_THRESHOLD else 0)
+            per_score = round((sum(per_window)/len(per_window))*100, 1) if len(per_window)>0 else 0.0
+
+            if cur_ear < EAR_THRESHOLD:
+                closed_eyes_counter += 1
+                if closed_eyes_counter >= 3 and not blink_active: blink_timestamps.append(now); blink_active = True
+            else: blink_active = False; closed_eyes_counter = 0
+
+            if cur_mar > MAR_THRESHOLD:
+                if not yawn_active: yawn_timestamps.append(now); yawn_active = True
+            else: yawn_active = False
+
+            while blink_timestamps and now - blink_timestamps[0] > FATIGUE_WINDOW: blink_timestamps.popleft()
+            while yawn_timestamps and now - yawn_timestamps[0] > FATIGUE_WINDOW: yawn_timestamps.popleft()
+            current_bpm = round(len(blink_timestamps) / (FATIGUE_WINDOW / 60), 1)
+
+            if closed_eyes_counter >= ALARM_FRAMES:
+                status = "CRITICAL: SLEEPING"; buzzer.on()
+            elif per_score >= PERCLOS_LIMIT or current_bpm >= BLINK_LIMIT_BPM or len(yawn_timestamps) >= YAWN_LIMIT:
+                status = "WARNING: FATIGUE"; buzzer.on() if int(now * 3) % 2 == 0 else buzzer.off()
+            else: buzzer.off()
+
+            if stream_active:
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.rectangle(bgr, (x, y), (x+fw, y+fh), (0, 255, 0), 2)
+                for ex, ey, ew, eh in eyes[:2]:
+                    cv2.rectangle(bgr, (x+ex, y+ey), (x+ex+ew, y+ey+eh), (255, 0, 0), 2)
+                _, buf = cv2.imencode('.jpg', bgr); latest_jpeg = buf.tobytes()
         else:
             status = "SEARCHING..."
             buzzer.off()
