@@ -35,14 +35,18 @@ ZOOM_FACTOR = 1.0
 
 telemetry = {
     "ear": 0.0, "mar": 0.0, "cpu": 0.0, "ram": 0.0, "temp": 0.0, "fps": 0,
-    "yawn_count": 0, "blink_count": 0, "bpm": 0.0, "perclos": 0.0, 
+    "yawn_count": 0, "blink_count": 0, "bpm": 0.0, "perclos": 0.0,
     "status": "INITIALIZING", "uptime": 0, "streaming": False,
-    "lens_pos": 10.0, "zoom": 1.0
+    "lens_pos": 10.0, "zoom": 1.0,
+    "quality": 0.0, "det_rate": 0.0, "size_score": 0.0, "exposure_score": 0.0,
+    "eye_score": 0.0, "mouth_score": 0.0, "stability_score": 0.0,
+    "brightness": 0.0, "face_size": 0.0, "quality_hint": "NO FACE"
 }
 
 yawn_timestamps = deque()
 blink_timestamps = deque()
 per_window = deque(maxlen=1200)
+detect_window = deque(maxlen=100)
 
 # 2. HAAR CASCADE CLASSIFIERS (improved)
 import os
@@ -68,6 +72,53 @@ def calculate_mar_from_face(face_roi):
     total_pixels = mouth_region.size
     return dark_pixels / (total_pixels + 1)
 
+prev_face_center = None
+
+def score_band(value, good_lo, good_hi, zero_lo, zero_hi):
+    if good_lo <= value <= good_hi: return 100.0
+    if value < good_lo:
+        return max(0.0, 100.0 * (value - zero_lo) / (good_lo - zero_lo))
+    return max(0.0, 100.0 * (zero_hi - value) / (zero_hi - good_hi))
+
+def assess_quality(face_gray, face_box, frame_w, frame_h):
+    global prev_face_center
+    x, y, fw, fh = face_box
+    gh = face_gray.shape[0]
+
+    size_pct = 100.0 * (fw * fh) / (frame_w * frame_h)
+    brightness = float(np.mean(face_gray))
+
+    # Contrast in each band: a flat region means the EAR/MAR reading is noise.
+    eye_score = min(100.0, float(np.std(face_gray[:gh // 3, :])) * 2.5)
+    mouth_score = min(100.0, float(np.std(face_gray[int(gh * 0.6):, :])) * 2.5)
+
+    center = (x + fw / 2.0, y + fh / 2.0)
+    if prev_face_center is None:
+        stability_score = 100.0
+    else:
+        drift = np.hypot(center[0] - prev_face_center[0], center[1] - prev_face_center[1])
+        stability_score = max(0.0, 100.0 - (drift / max(fw, 1)) * 300.0)
+    prev_face_center = center
+
+    return {
+        "size_score": score_band(size_pct, 8.0, 40.0, 1.5, 75.0),
+        "exposure_score": score_band(brightness, 90.0, 170.0, 25.0, 240.0),
+        "eye_score": eye_score, "mouth_score": mouth_score,
+        "stability_score": stability_score,
+        "brightness": brightness, "face_size": size_pct,
+    }
+
+def quality_hint(det_rate, q):
+    if det_rate < 40: return "FACE RARELY FOUND - CHECK FRAMING"
+    if q["face_size"] < 8: return "FACE TOO SMALL - INCREASE ZOOM"
+    if q["face_size"] > 40: return "FACE TOO LARGE - REDUCE ZOOM"
+    if q["brightness"] < 90: return "TOO DARK - ADD LIGHT"
+    if q["brightness"] > 170: return "OVEREXPOSED - REDUCE LIGHT"
+    if q["eye_score"] < 40: return "EYE REGION BLURRY - ADJUST FOCUS"
+    if q["stability_score"] < 50: return "UNSTABLE - POSSIBLE FALSE DETECTION"
+    if det_rate < 80: return "INTERMITTENT - HOLD STILL / FACE CAMERA"
+    return "GOOD"
+
 def get_pi_temp():
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
@@ -90,6 +141,8 @@ HTML_PAGE = """
         .stat-label { font-size: 10px; color: #8b949e; text-transform: uppercase; }
         .status-bar { font-size: 22px; font-weight: bold; padding: 12px; background: #161b22; }
         .status-ok { color: #3fb950; } .status-warn { color: #d29922; background: #332200; } .status-crit { color: #f85149; background: #330000; }
+        .hint-bar { font-size: 14px; padding: 8px; background: #0d1117; color: #8b949e; letter-spacing: 1px; border-bottom: 1px solid #30363d; }
+        .hint-good { color: #3fb950; } .hint-bad { color: #d29922; }
         .container { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; padding: 20px; }
         .video-box { border: 2px solid #30363d; border-radius: 12px; width: 640px; height: 360px; overflow: hidden; background: #000; }
         .chart-box { background: #161b22; padding: 15px; border-radius: 12px; width: 500px; border: 1px solid #30363d; }
@@ -111,6 +164,8 @@ HTML_PAGE = """
         </div>
     </div>
     <div class="live-stats">
+        <div class="stat-item"><span class="stat-val" id="curQUAL">0</span><span class="stat-label">Quality</span></div>
+        <div class="stat-item"><span class="stat-val" id="curDET">0%</span><span class="stat-label">Detect Rate</span></div>
         <div class="stat-item"><span class="stat-val" id="curEAR">0.00</span><span class="stat-label">EAR</span></div>
         <div class="stat-item"><span class="stat-val" id="curMAR">0.00</span><span class="stat-label">MAR</span></div>
         <div class="stat-item"><span class="stat-val" id="curPER">0.0%</span><span class="stat-label">PERCLOS</span></div>
@@ -120,17 +175,19 @@ HTML_PAGE = """
         <div class="stat-item"><span class="stat-val" id="curTMP">0C</span><span class="stat-label">Temp</span></div>
     </div>
     <div id="statusDiv" class="status-bar status-ok">SYSTEM STATUS: OK</div>
+    <div id="hintDiv" class="hint-bar">SIGNAL: NO FACE</div>
     <div class="container">
         <div class="video-box"><img id="streamImg" src="/video_feed" style="width: 100%;"></div>
         <div class="chart-box"><h3>Fatigue Trends</h3><canvas id="fatigueChart"></canvas></div>
     </div>
     <div class="container">
+        <div class="chart-box"><h3>Detection Quality</h3><canvas id="qualityChart"></canvas></div>
         <div class="chart-box"><h3>Biometrics (EAR/MAR)</h3><canvas id="driverChart"></canvas></div>
         <div class="chart-box"><h3>Behavior History</h3><canvas id="behaviorChart"></canvas></div>
         <div class="chart-box"><h3>System Performance</h3><canvas id="sysChart"></canvas></div>
     </div>
     <script>
-        const ds = { cpu:[], temp:[], ram:[], fps:[], ear:[], mar:[], perclos:[], bpm:[], blink_count:[], yawn_count:[] };
+        const ds = { cpu:[], temp:[], ram:[], fps:[], ear:[], mar:[], perclos:[], bpm:[], blink_count:[], yawn_count:[], quality:[], det_rate:[], eye_score:[], mouth_score:[] };
         const labels = Array(120).fill('');
         Object.keys(ds).forEach(k => ds[k] = Array(120).fill(null));
 
@@ -140,7 +197,8 @@ HTML_PAGE = """
         function toggleStream() { fetch('/api/toggle_stream'); }
 
         const fChart = new Chart(document.getElementById('fatigueChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'PERCLOS %', borderColor:'#d29922', data:ds.perclos, yAxisID:'y', pointRadius:0},{label:'BPM', borderColor:'#bc8cff', data:ds.bpm, yAxisID:'y1', pointRadius:0}]}, options:{animation:false, scales:{y:{position:'left', suggestedMax:30},y1:{position:'right', suggestedMax:60, grid:{drawOnChartArea:false}}}} });
-        const dChart = new Chart(document.getElementById('driverChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'EAR', borderColor:'#58a6ff', data:ds.ear, pointRadius:0},{label:'MAR', borderColor:'#3fb950', data:ds.mar, pointRadius:0}]}, options:{animation:false, scales:{y:{suggestedMax:0.6}}}} );
+        const qChart = new Chart(document.getElementById('qualityChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'Quality', borderColor:'#3fb950', data:ds.quality, pointRadius:0, borderWidth:2},{label:'Detect %', borderColor:'#58a6ff', data:ds.det_rate, pointRadius:0},{label:'Eye Signal', borderColor:'#bc8cff', data:ds.eye_score, pointRadius:0},{label:'Mouth Signal', borderColor:'#d29922', data:ds.mouth_score, pointRadius:0}]}, options:{animation:false, scales:{y:{min:0, max:100}}}} );
+        const dChart = new Chart(document.getElementById('driverChart').getContext('2d'),{ type:'line', data:{labels:labels, datasets:[{label:'EAR', borderColor:'#58a6ff', data:ds.ear, pointRadius:0},{label:'MAR', borderColor:'#3fb950', data:ds.mar, pointRadius:0}]}, options:{animation:false, scales:{y:{suggestedMax:0.6}}}} );
         const bChart = new Chart(document.getElementById('behaviorChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'Blinks', borderColor:'#58a6ff', data:ds.blink_count, fill:true, pointRadius:0, yAxisID:'y'},{label:'Yawns', borderColor:'#f85149', data:ds.yawn_count, pointRadius:0, yAxisID:'y1'}]}, options:{animation:false, scales:{y:{position:'left'}, y1:{position:'right', suggestedMax:10, grid:{drawOnChartArea:false}}}} });
         const sChart = new Chart(document.getElementById('sysChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'CPU %', borderColor:'#f85149', data:ds.cpu, pointRadius:0},{label:'FPS', borderColor:'#58a6ff', data:ds.fps, pointRadius:0},{label:'Temp C', borderColor:'#d29922', data:ds.temp, pointRadius:0}]}, options:{animation:false, scales:{y:{suggestedMax:100}}}} );
 
@@ -151,8 +209,13 @@ HTML_PAGE = """
                 document.getElementById('curEAR').innerText = d.ear.toFixed(2); document.getElementById('curMAR').innerText = d.mar.toFixed(2);
                 document.getElementById('curPER').innerText = d.perclos + "%"; document.getElementById('curBPM').innerText = d.bpm;
                 document.getElementById('curFPS').innerText = d.fps; document.getElementById('curCPU').innerText = d.cpu + "%"; document.getElementById('curTMP').innerText = d.temp + "C";
+                document.getElementById('curQUAL').innerText = d.quality; document.getElementById('curDET').innerText = d.det_rate + "%";
+                document.getElementById('curQUAL').style.color = d.quality >= 70 ? '#3fb950' : (d.quality >= 40 ? '#d29922' : '#f85149');
+                const hint = document.getElementById('hintDiv');
+                hint.innerText = "SIGNAL: " + d.quality_hint;
+                hint.className = "hint-bar " + (d.quality_hint === "GOOD" ? "hint-good" : "hint-bad");
                 Object.keys(ds).forEach(k => { ds[k].shift(); ds[k].push(d[k]); });
-                fChart.update(); dChart.update(); sChart.update(); bChart.update();
+                fChart.update(); dChart.update(); sChart.update(); bChart.update(); qChart.update();
                 const btn = document.getElementById('streamBtn'); btn.innerText = d.streaming ? "DISABLE VIDEO" : "ENABLE VIDEO"; btn.className = d.streaming ? "btn-toggle active" : "btn-toggle";
             });
         }, 1000);
@@ -216,7 +279,7 @@ def video_feed():
 
 # 5. MAIN AI ENGINE
 def main():
-    global latest_jpeg, stream_active, telemetry, last_status, event_logs, EAR_THRESHOLD, picam, ZOOM_FACTOR
+    global latest_jpeg, stream_active, telemetry, last_status, event_logs, EAR_THRESHOLD, picam, ZOOM_FACTOR, prev_face_center
     
     buzzer = Buzzer(17); picam = Picamera2()
     
@@ -240,6 +303,9 @@ def main():
 
     closed_eyes_counter = 0; blink_active = False; yawn_active = False; per_score = 0.0; current_bpm = 0.0
     start_time = time.time(); prev_time = time.time()
+    q = {"size_score": 0.0, "exposure_score": 0.0, "eye_score": 0.0, "mouth_score": 0.0,
+         "stability_score": 0.0, "brightness": 0.0, "face_size": 0.0}
+    overall_quality = 0.0; hint = "NO FACE"; det_rate = 0.0
 
     while True:
         frame = picam.capture_array()
@@ -259,11 +325,20 @@ def main():
         faces = face_cascade.detectMultiScale(gray, 1.05, 4, minSize=(80, 80))
         cur_ear = 0.0; cur_mar = 0.0; status = "OK"
 
+        detect_window.append(1 if len(faces) > 0 else 0)
+        det_rate = round(100.0 * sum(detect_window) / len(detect_window), 1)
+
         if len(faces) > 0:
             x, y, fw, fh = faces[0]
-            face_roi = frame[y:y+fh, x:x+fw]
-            cur_ear = calculate_ear_from_face(face_roi)
-            cur_mar = calculate_mar_from_face(face_roi)
+            face_gray = gray[y:y+fh, x:x+fw]
+            cur_ear = calculate_ear_from_face(face_gray)
+            cur_mar = calculate_mar_from_face(face_gray)
+
+            q = assess_quality(face_gray, faces[0], w, h)
+            overall_quality = round(
+                det_rate * 0.40 + q["size_score"] * 0.15 + q["exposure_score"] * 0.15
+                + q["eye_score"] * 0.15 + q["mouth_score"] * 0.075 + q["stability_score"] * 0.075, 1)
+            hint = quality_hint(det_rate, q)
 
             per_window.append(1 if cur_ear < EAR_THRESHOLD else 0)
             per_score = round((sum(per_window)/len(per_window))*100, 1) if len(per_window)>0 else 0.0
@@ -295,12 +370,22 @@ def main():
         else:
             status = "SEARCHING..."
             buzzer.off()
+            prev_face_center = None
+            overall_quality = round(
+                det_rate * 0.40 + q["size_score"] * 0.15 + q["exposure_score"] * 0.15
+                + q["eye_score"] * 0.15 + q["mouth_score"] * 0.075 + q["stability_score"] * 0.075, 1)
+            hint = "NO FACE" if det_rate < 5 else quality_hint(det_rate, q)
             if stream_active:
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 cv2.putText(bgr, "SEARCHING...", (150, 180), 1, 1.5, (0, 0, 255), 2)
                 _, buf = cv2.imencode('.jpg', bgr); latest_jpeg = buf.tobytes()
 
-        telemetry.update({"ear":cur_ear, "mar":cur_mar, "perclos":per_score, "bpm": current_bpm, "blink_count":len(blink_timestamps), "yawn_count":len(yawn_timestamps), "status":status, "cpu":psutil.cpu_percent(), "temp":get_pi_temp(), "fps":int(fps)})
+        telemetry.update({"ear":cur_ear, "mar":cur_mar, "perclos":per_score, "bpm": current_bpm, "blink_count":len(blink_timestamps), "yawn_count":len(yawn_timestamps), "status":status, "cpu":psutil.cpu_percent(), "temp":get_pi_temp(), "fps":int(fps),
+                          "quality":overall_quality, "det_rate":det_rate, "quality_hint":hint,
+                          "size_score":round(q["size_score"],1), "exposure_score":round(q["exposure_score"],1),
+                          "eye_score":round(q["eye_score"],1), "mouth_score":round(q["mouth_score"],1),
+                          "stability_score":round(q["stability_score"],1),
+                          "brightness":round(q["brightness"],1), "face_size":round(q["face_size"],1)})
 
 if __name__ == '__main__':
     main()
