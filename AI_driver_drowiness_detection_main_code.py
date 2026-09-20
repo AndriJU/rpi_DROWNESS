@@ -44,11 +44,30 @@ yawn_timestamps = deque()
 blink_timestamps = deque()
 per_window = deque(maxlen=1200)
 
-# 2. HAAR CASCADE CLASSIFIERS
+# 2. DNN FACE DETECTOR
 import os
 cascade_dir = os.path.join(os.path.dirname(__file__), 'cascades')
-face_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_frontalface_default.xml'))
 eye_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_eye.xml'))
+
+modelFile = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/opencv_face_detector_uint8.pb"
+configFile = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/opencv_face_detector.pbtxt"
+net = cv2.dnn.readNetFromTensorflow(modelFile, configFile)
+
+def get_face_detections(frame):
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), [104, 117, 123], False, False)
+    net.setInput(blob)
+    detections = net.forward()
+    faces = []
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.5:
+            x1 = int(detections[0, 0, i, 3] * w)
+            y1 = int(detections[0, 0, i, 4] * h)
+            x2 = int(detections[0, 0, i, 5] * w)
+            y2 = int(detections[0, 0, i, 6] * h)
+            faces.append((x1, y1, x2-x1, y2-y1))
+    return faces
 
 def calculate_eye_ratio(eye_region):
     gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY) if len(eye_region.shape) == 3 else eye_region
@@ -255,7 +274,7 @@ def main():
         
         frame = cv2.flip(frame, 1); h, w, _ = frame.shape
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        faces = get_face_detections(frame)
         cur_ear = 0.0; cur_mar = 0.0; status = "OK"
 
         if len(faces) > 0:
