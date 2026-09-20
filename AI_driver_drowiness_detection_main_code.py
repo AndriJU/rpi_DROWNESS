@@ -21,9 +21,17 @@ EAR_THRESHOLD = 0.20
 MAR_THRESHOLD = 0.5
 ALARM_FRAMES = 15      
 FATIGUE_WINDOW = 180   
-YAWN_LIMIT = 3         
-BLINK_LIMIT_BPM = 25   
-PERCLOS_LIMIT = 15.0   
+YAWN_LIMIT = 3
+BLINK_LIMIT_BPM = 25
+PERCLOS_LIMIT = 15.0
+
+# BUZZER (Matek DBuz5V on GPIO17)
+BUZZER_PIN = 17
+BEEP_PULSE = 0.008     # 8 ms click
+WARN_INTERVAL = 1.00   # one click per second
+CRIT_INTERVAL = 0.12   # rapid clicking
+alert_level = "OK"
+test_beep_request = False
 
 # GLOBALS
 latest_jpeg = None
@@ -119,6 +127,22 @@ def quality_hint(det_rate, q):
     if det_rate < 80: return "INTERMITTENT - HOLD STILL / FACE CAMERA"
     return "GOOD"
 
+def beeper_loop(buzzer):
+    # Runs off the frame loop so pulse width is not quantised to the frame period.
+    global test_beep_request
+    while True:
+        if test_beep_request:
+            test_beep_request = False
+            for _ in range(3):
+                buzzer.on(); time.sleep(BEEP_PULSE); buzzer.off(); time.sleep(0.15)
+        level = alert_level
+        if level == "CRITICAL":
+            buzzer.on(); time.sleep(BEEP_PULSE); buzzer.off(); time.sleep(CRIT_INTERVAL)
+        elif level == "WARNING":
+            buzzer.on(); time.sleep(BEEP_PULSE); buzzer.off(); time.sleep(WARN_INTERVAL)
+        else:
+            buzzer.off(); time.sleep(0.05)
+
 def get_pi_temp():
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
@@ -161,6 +185,7 @@ HTML_PAGE = """
             <div class="slider-group">FOCUS: <span id="focusVal">10.0</span><br><input type="range" id="focusSlider" min="0.0" max="12.0" step="0.1" value="10.0" oninput="updateFocus(this.value)"></div>
             <div class="slider-group">ZOOM: <span id="zoomVal">1.0</span>x<br><input type="range" id="zoomSlider" min="1.0" max="3.0" step="0.1" value="1.0" oninput="updateZoom(this.value)"></div>
             <button id="streamBtn" class="btn-toggle" onclick="toggleStream()">ENABLE VIDEO</button>
+            <button class="btn-toggle" style="background:#1f6feb" onclick="fetch('/api/test_beep')">TEST BEEP</button>
         </div>
     </div>
     <div class="live-stats">
@@ -234,6 +259,12 @@ def toggle_stream():
     stream_active = not stream_active
     return jsonify(streaming=stream_active)
 
+@app.route('/api/test_beep')
+def test_beep():
+    global test_beep_request
+    test_beep_request = True
+    return jsonify(success=True)
+
 @app.route('/api/set_ear')
 def set_ear():
     global EAR_THRESHOLD
@@ -279,9 +310,10 @@ def video_feed():
 
 # 5. MAIN AI ENGINE
 def main():
-    global latest_jpeg, stream_active, telemetry, last_status, event_logs, EAR_THRESHOLD, picam, ZOOM_FACTOR, prev_face_center
+    global latest_jpeg, stream_active, telemetry, last_status, event_logs, EAR_THRESHOLD, picam, ZOOM_FACTOR, prev_face_center, alert_level
     
-    buzzer = Buzzer(17); picam = Picamera2()
+    buzzer = Buzzer(BUZZER_PIN); picam = Picamera2()
+    threading.Thread(target=beeper_loop, args=(buzzer,), daemon=True).start()
     
     # FORCING 60FPS HARDWARE CONFIG
     config = picam.create_preview_configuration(
@@ -357,10 +389,10 @@ def main():
             current_bpm = round(len(blink_timestamps) / (FATIGUE_WINDOW / 60), 1)
 
             if closed_eyes_counter >= ALARM_FRAMES:
-                status = "CRITICAL: SLEEPING"; buzzer.on()
+                status = "CRITICAL: SLEEPING"; alert_level = "CRITICAL"
             elif per_score >= PERCLOS_LIMIT or current_bpm >= BLINK_LIMIT_BPM or len(yawn_timestamps) >= YAWN_LIMIT:
-                status = "WARNING: FATIGUE"; buzzer.on() if int(now * 3) % 2 == 0 else buzzer.off()
-            else: buzzer.off()
+                status = "WARNING: FATIGUE"; alert_level = "WARNING"
+            else: alert_level = "OK"
 
             if stream_active:
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -369,7 +401,7 @@ def main():
                 _, buf = cv2.imencode('.jpg', bgr); latest_jpeg = buf.tobytes()
         else:
             status = "SEARCHING..."
-            buzzer.off()
+            alert_level = "OK"
             prev_face_center = None
             overall_quality = round(
                 det_rate * 0.40 + q["size_score"] * 0.15 + q["exposure_score"] * 0.15
