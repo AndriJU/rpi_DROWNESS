@@ -8,6 +8,7 @@ from collections import deque
 from picamera2 import Picamera2
 from flask import Flask, Response, render_template_string, jsonify, request
 from gpiozero import Buzzer
+import subprocess
 import logging
 
 
@@ -186,6 +187,7 @@ HTML_PAGE = """
             <div class="slider-group">ZOOM: <span id="zoomVal">1.0</span>x<br><input type="range" id="zoomSlider" min="1.0" max="3.0" step="0.1" value="1.0" oninput="updateZoom(this.value)"></div>
             <button id="streamBtn" class="btn-toggle" onclick="toggleStream()">ENABLE VIDEO</button>
             <button class="btn-toggle" style="background:#1f6feb" onclick="fetch('/api/test_beep')">TEST BEEP</button>
+            <button class="btn-toggle" style="background:#6e2018" onclick="doShutdown()">SHUT DOWN</button>
         </div>
     </div>
     <div class="live-stats">
@@ -198,6 +200,13 @@ HTML_PAGE = """
         <div class="stat-item"><span class="stat-val" id="curFPS">0</span><span class="stat-label">FPS</span></div>
         <div class="stat-item"><span class="stat-val" id="curCPU">0%</span><span class="stat-label">CPU</span></div>
         <div class="stat-item"><span class="stat-val" id="curTMP">0C</span><span class="stat-label">Temp</span></div>
+    </div>
+    <div id="shutdownOverlay" style="display:none; position:fixed; inset:0; background:#0b0e14; z-index:999; padding-top:18vh;">
+        <h1 style="color:#f85149; letter-spacing:2px;">SHUTTING DOWN</h1>
+        <p style="color:#e1e1e1; font-size:18px; max-width:520px; margin:20px auto; line-height:1.6;">
+            Wait for the Pi's green activity LED to stop flashing, then wait 5 more seconds.<br><br>
+            Only then is it safe to disconnect power.
+        </p>
     </div>
     <div id="statusDiv" class="status-bar status-ok">SYSTEM STATUS: OK</div>
     <div id="hintDiv" class="hint-bar">SIGNAL: NO FACE</div>
@@ -220,6 +229,12 @@ HTML_PAGE = """
         function updateFocus(val) { document.getElementById('focusVal').innerText = val; fetch(`/api/set_focus?val=${val}`); }
         function updateZoom(val) { document.getElementById('zoomVal').innerText = val; fetch(`/api/set_zoom?val=${val}`); }
         function toggleStream() { fetch('/api/toggle_stream'); }
+        function doShutdown() {
+            if (!confirm('Shut down the Raspberry Pi?\n\nMonitoring will stop and you will need physical access to power it back on.')) return;
+            fetch('/api/shutdown?confirm=yes');
+            clearInterval(poll);
+            document.getElementById('shutdownOverlay').style.display = 'block';
+        }
 
         const fChart = new Chart(document.getElementById('fatigueChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'PERCLOS %', borderColor:'#d29922', data:ds.perclos, yAxisID:'y', pointRadius:0},{label:'BPM', borderColor:'#bc8cff', data:ds.bpm, yAxisID:'y1', pointRadius:0}]}, options:{animation:false, scales:{y:{position:'left', suggestedMax:30},y1:{position:'right', suggestedMax:60, grid:{drawOnChartArea:false}}}} });
         const qChart = new Chart(document.getElementById('qualityChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'Quality', borderColor:'#3fb950', data:ds.quality, pointRadius:0, borderWidth:2},{label:'Detect %', borderColor:'#58a6ff', data:ds.det_rate, pointRadius:0},{label:'Eye Signal', borderColor:'#bc8cff', data:ds.eye_score, pointRadius:0},{label:'Mouth Signal', borderColor:'#d29922', data:ds.mouth_score, pointRadius:0}]}, options:{animation:false, scales:{y:{min:0, max:100}}}} );
@@ -227,7 +242,7 @@ HTML_PAGE = """
         const bChart = new Chart(document.getElementById('behaviorChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'Blinks', borderColor:'#58a6ff', data:ds.blink_count, fill:true, pointRadius:0, yAxisID:'y'},{label:'Yawns', borderColor:'#f85149', data:ds.yawn_count, pointRadius:0, yAxisID:'y1'}]}, options:{animation:false, scales:{y:{position:'left'}, y1:{position:'right', suggestedMax:10, grid:{drawOnChartArea:false}}}} });
         const sChart = new Chart(document.getElementById('sysChart').getContext('2d'), { type:'line', data:{labels:labels, datasets:[{label:'CPU %', borderColor:'#f85149', data:ds.cpu, pointRadius:0},{label:'FPS', borderColor:'#58a6ff', data:ds.fps, pointRadius:0},{label:'Temp C', borderColor:'#d29922', data:ds.temp, pointRadius:0}]}, options:{animation:false, scales:{y:{suggestedMax:100}}}} );
 
-        setInterval(() => {
+        const poll = setInterval(() => {
             fetch('/api/telemetry').then(r => r.json()).then(d => {
                 document.getElementById('statusDiv').innerText = "SYSTEM STATUS: " + d.status;
                 document.getElementById('statusDiv').className = "status-bar " + (d.status.includes('CRITICAL') ? 'status-crit' : (d.status.includes('WARNING') ? 'status-warn' : 'status-ok'));
@@ -258,6 +273,18 @@ def toggle_stream():
     global stream_active
     stream_active = not stream_active
     return jsonify(streaming=stream_active)
+
+@app.route('/api/shutdown')
+def shutdown():
+    global alert_level
+    if request.args.get('confirm') != 'yes':
+        return jsonify(success=False, error="confirmation required"), 400
+    alert_level = "OK"
+    def halt():
+        time.sleep(1.0)  # let the HTTP response reach the browser first
+        subprocess.run(["sudo", "shutdown", "-h", "now"])
+    threading.Thread(target=halt, daemon=True).start()
+    return jsonify(success=True)
 
 @app.route('/api/test_beep')
 def test_beep():
