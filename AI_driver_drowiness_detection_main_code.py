@@ -230,7 +230,7 @@ HTML_PAGE = """
         function updateZoom(val) { document.getElementById('zoomVal').innerText = val; fetch(`/api/set_zoom?val=${val}`); }
         function toggleStream() { fetch('/api/toggle_stream'); }
         function doShutdown() {
-            if (!confirm('Shut down the Raspberry Pi?\n\nMonitoring will stop and you will need physical access to power it back on.')) return;
+            if (!confirm('Shut down the Raspberry Pi? Monitoring stops and you will need physical access to power it back on.')) return;
             fetch('/api/shutdown?confirm=yes');
             clearInterval(poll);
             document.getElementById('shutdownOverlay').style.display = 'block';
