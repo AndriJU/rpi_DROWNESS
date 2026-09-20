@@ -47,10 +47,11 @@ per_window = deque(maxlen=1200)
 # 2. DNN FACE DETECTOR
 import os
 cascade_dir = os.path.join(os.path.dirname(__file__), 'cascades')
+models_dir = os.path.join(os.path.dirname(__file__), 'models')
 eye_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_eye.xml'))
 
-modelFile = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/opencv_face_detector_uint8.pb"
-configFile = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/opencv_face_detector.pbtxt"
+modelFile = os.path.join(models_dir, 'opencv_face_detector_uint8.pb')
+configFile = os.path.join(models_dir, 'opencv_face_detector.pbtxt')
 net = cv2.dnn.readNetFromTensorflow(modelFile, configFile)
 
 def get_face_detections(frame):
