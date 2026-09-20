@@ -45,8 +45,10 @@ blink_timestamps = deque()
 per_window = deque(maxlen=1200)
 
 # 2. HAAR CASCADE CLASSIFIERS
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+import os
+cascade_dir = os.path.join(os.path.dirname(__file__), 'cascades')
+face_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_frontalface_default.xml'))
+eye_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_eye.xml'))
 
 def calculate_eye_ratio(eye_region):
     gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY) if len(eye_region.shape) == 3 else eye_region
