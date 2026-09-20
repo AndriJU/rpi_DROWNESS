@@ -70,13 +70,15 @@ face_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_fron
 eye_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_eye.xml'))
 
 def calculate_ear_from_face(face_roi):
+    # Proxy for eye openness: pupils and lashes are dark, eyelid skin is not,
+    # so the dark fraction of the eye band falls when the eyes close. Returned
+    # in real-EAR sense (high = open) because every caller tests "< threshold".
     gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY) if len(face_roi.shape) == 3 else face_roi
-    h, w = gray.shape
-    eye_region = gray[:h//3, :]
+    h = gray.shape[0]
+    eye_region = gray[int(h * 0.20):int(h * 0.50), :]
     threshold = cv2.threshold(eye_region, 100, 255, cv2.THRESH_BINARY)[1]
-    dark_pixels = np.sum(threshold == 0)
-    total_pixels = eye_region.size
-    return 1.0 - (dark_pixels / (total_pixels + 1))
+    dark_pixels = int(np.sum(threshold == 0))
+    return dark_pixels / (eye_region.size + 1)
 
 def calculate_mar_from_face(face_roi):
     gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY) if len(face_roi.shape) == 3 else face_roi
@@ -213,6 +215,7 @@ HTML_PAGE = """
             <button class="btn-toggle" style="background:#1f6feb" onclick="fetch('/api/test_beep')">TEST BEEP</button>
             <button class="btn-toggle" style="background:#8957e5" onclick="fetch('/api/hold_test')">HOLD 1s</button>
             <button id="polBtn" class="btn-toggle" style="background:#30363d" onclick="fetch('/api/toggle_polarity')">HIGH = ON</button>
+            <button class="btn-toggle" style="background:#9e6a03" onclick="resetStats()">RESET STATS</button>
             <button class="btn-toggle" style="background:#6e2018" onclick="doShutdown()">SHUT DOWN</button>
         </div>
     </div>
@@ -255,6 +258,11 @@ HTML_PAGE = """
         function updateFocus(val) { document.getElementById('focusVal').innerText = val; fetch(`/api/set_focus?val=${val}`); }
         function updateZoom(val) { document.getElementById('zoomVal').innerText = val; fetch(`/api/set_zoom?val=${val}`); }
         function toggleStream() { fetch('/api/toggle_stream'); }
+        function resetStats() {
+            fetch('/api/reset_stats');
+            Object.keys(ds).forEach(k => ds[k].fill(null));
+            fChart.update(); dChart.update(); sChart.update(); bChart.update(); qChart.update();
+        }
         function updatePulse(val) { document.getElementById('pulseVal').innerText = val; fetch('/api/set_pulse?val=' + val); }
         function doShutdown() {
             if (!confirm('Shut down the Raspberry Pi? Monitoring stops and you will need physical access to power it back on.')) return;
@@ -318,6 +326,13 @@ def shutdown():
 def test_beep():
     global test_beep_request
     test_beep_request = True
+    return jsonify(success=True)
+
+@app.route('/api/reset_stats')
+def reset_stats():
+    global last_warn_time
+    per_window.clear(); blink_timestamps.clear(); yawn_timestamps.clear(); detect_window.clear()
+    last_warn_time = 0.0
     return jsonify(success=True)
 
 @app.route('/api/hold_test')
