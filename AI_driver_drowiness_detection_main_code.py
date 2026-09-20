@@ -7,7 +7,7 @@ import threading
 from collections import deque
 from picamera2 import Picamera2
 from flask import Flask, Response, render_template_string, jsonify, request
-from gpiozero import Buzzer
+from gpiozero import DigitalOutputDevice
 import subprocess
 import logging
 
@@ -26,13 +26,15 @@ YAWN_LIMIT = 3
 BLINK_LIMIT_BPM = 25
 PERCLOS_LIMIT = 15.0
 
-# BUZZER (Matek DBuz5V on GPIO17)
+# BUZZER (Matek DBuz5V on GPIO17, driven via external transistor)
 BUZZER_PIN = 17
-BEEP_PULSE = 0.008     # 8 ms click
+BEEP_PULSE_MS = 8.0    # tunable live; a common-emitter stage may need more
 WARN_INTERVAL = 1.00   # one click per second
 CRIT_INTERVAL = 0.12   # rapid clicking
+BUZZER_ACTIVE_HIGH = True   # False if the transistor stage inverts
 alert_level = "OK"
 test_beep_request = False
+hold_request = False
 
 # GLOBALS
 latest_jpeg = None
@@ -128,21 +130,33 @@ def quality_hint(det_rate, q):
     if det_rate < 80: return "INTERMITTENT - HOLD STILL / FACE CAMERA"
     return "GOOD"
 
-def beeper_loop(buzzer):
+def set_buzzer(dev, on):
+    # Polarity in software, so it can be flipped live without reopening the pin.
+    dev.value = 1 if (on == BUZZER_ACTIVE_HIGH) else 0
+
+def click(dev):
+    set_buzzer(dev, True); time.sleep(BEEP_PULSE_MS / 1000.0); set_buzzer(dev, False)
+
+def beeper_loop(dev):
     # Runs off the frame loop so pulse width is not quantised to the frame period.
-    global test_beep_request
+    global test_beep_request, hold_request
     while True:
+        if hold_request:
+            hold_request = False
+            set_buzzer(dev, True); time.sleep(1.0); set_buzzer(dev, False)
+            time.sleep(0.2); continue
         if test_beep_request:
             test_beep_request = False
             for _ in range(3):
-                buzzer.on(); time.sleep(BEEP_PULSE); buzzer.off(); time.sleep(0.15)
+                click(dev); time.sleep(0.15)
+            continue
         level = alert_level
         if level == "CRITICAL":
-            buzzer.on(); time.sleep(BEEP_PULSE); buzzer.off(); time.sleep(CRIT_INTERVAL)
+            click(dev); time.sleep(CRIT_INTERVAL)
         elif level == "WARNING":
-            buzzer.on(); time.sleep(BEEP_PULSE); buzzer.off(); time.sleep(WARN_INTERVAL)
+            click(dev); time.sleep(WARN_INTERVAL)
         else:
-            buzzer.off(); time.sleep(0.05)
+            set_buzzer(dev, False); time.sleep(0.05)
 
 def get_pi_temp():
     try:
@@ -171,7 +185,7 @@ HTML_PAGE = """
         .container { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; padding: 20px; }
         .video-box { border: 2px solid #30363d; border-radius: 12px; width: 640px; height: 360px; overflow: hidden; background: #000; }
         .chart-box { background: #161b22; padding: 15px; border-radius: 12px; width: 500px; border: 1px solid #30363d; }
-        .control-panel { background: #21262d; padding: 15px; border-radius: 12px; border: 1px solid #30363d; display: flex; gap: 20px; align-items: center; }
+        .control-panel { background: #21262d; padding: 15px; border-radius: 12px; border: 1px solid #30363d; display: flex; flex-wrap: wrap; gap: 15px; align-items: center; justify-content: center; }
         .slider-group { text-align: left; font-size: 12px; }
         .btn-toggle { padding: 12px 24px; border-radius: 6px; border: none; font-weight: bold; cursor: pointer; background: #238636; color: white; }
         .btn-toggle.active { background: #da3633; }
@@ -186,7 +200,10 @@ HTML_PAGE = """
             <div class="slider-group">FOCUS: <span id="focusVal">10.0</span><br><input type="range" id="focusSlider" min="0.0" max="12.0" step="0.1" value="10.0" oninput="updateFocus(this.value)"></div>
             <div class="slider-group">ZOOM: <span id="zoomVal">1.0</span>x<br><input type="range" id="zoomSlider" min="1.0" max="3.0" step="0.1" value="1.0" oninput="updateZoom(this.value)"></div>
             <button id="streamBtn" class="btn-toggle" onclick="toggleStream()">ENABLE VIDEO</button>
+            <div class="slider-group">PULSE: <span id="pulseVal">8</span> ms<br><input type="range" id="pulseSlider" min="1" max="300" step="1" value="8" oninput="updatePulse(this.value)"></div>
             <button class="btn-toggle" style="background:#1f6feb" onclick="fetch('/api/test_beep')">TEST BEEP</button>
+            <button class="btn-toggle" style="background:#8957e5" onclick="fetch('/api/hold_test')">HOLD 1s</button>
+            <button id="polBtn" class="btn-toggle" style="background:#30363d" onclick="fetch('/api/toggle_polarity')">HIGH = ON</button>
             <button class="btn-toggle" style="background:#6e2018" onclick="doShutdown()">SHUT DOWN</button>
         </div>
     </div>
@@ -229,6 +246,7 @@ HTML_PAGE = """
         function updateFocus(val) { document.getElementById('focusVal').innerText = val; fetch(`/api/set_focus?val=${val}`); }
         function updateZoom(val) { document.getElementById('zoomVal').innerText = val; fetch(`/api/set_zoom?val=${val}`); }
         function toggleStream() { fetch('/api/toggle_stream'); }
+        function updatePulse(val) { document.getElementById('pulseVal').innerText = val; fetch('/api/set_pulse?val=' + val); }
         function doShutdown() {
             if (!confirm('Shut down the Raspberry Pi? Monitoring stops and you will need physical access to power it back on.')) return;
             fetch('/api/shutdown?confirm=yes');
@@ -257,6 +275,7 @@ HTML_PAGE = """
                 Object.keys(ds).forEach(k => { ds[k].shift(); ds[k].push(d[k]); });
                 fChart.update(); dChart.update(); sChart.update(); bChart.update(); qChart.update();
                 const btn = document.getElementById('streamBtn'); btn.innerText = d.streaming ? "DISABLE VIDEO" : "ENABLE VIDEO"; btn.className = d.streaming ? "btn-toggle active" : "btn-toggle";
+                document.getElementById('polBtn').innerText = d.active_high ? "HIGH = ON" : "LOW = ON";
             });
         }, 1000);
     </script>
@@ -292,6 +311,26 @@ def test_beep():
     test_beep_request = True
     return jsonify(success=True)
 
+@app.route('/api/hold_test')
+def hold_test():
+    global hold_request
+    hold_request = True
+    return jsonify(success=True)
+
+@app.route('/api/set_pulse')
+def set_pulse():
+    global BEEP_PULSE_MS
+    try:
+        BEEP_PULSE_MS = max(1.0, min(500.0, float(request.args.get('val'))))
+        return jsonify(success=True, pulse=BEEP_PULSE_MS)
+    except: return jsonify(success=False)
+
+@app.route('/api/toggle_polarity')
+def toggle_polarity():
+    global BUZZER_ACTIVE_HIGH
+    BUZZER_ACTIVE_HIGH = not BUZZER_ACTIVE_HIGH
+    return jsonify(success=True, active_high=BUZZER_ACTIVE_HIGH)
+
 @app.route('/api/set_ear')
 def set_ear():
     global EAR_THRESHOLD
@@ -320,6 +359,7 @@ def set_zoom():
 @app.route('/api/telemetry')
 def get_telemetry(): 
     res = telemetry.copy(); res["logs"] = list(event_logs); res["streaming"] = stream_active
+    res["pulse_ms"] = BEEP_PULSE_MS; res["active_high"] = BUZZER_ACTIVE_HIGH
     return jsonify(res)
 
 @app.route('/video_feed')
@@ -339,7 +379,8 @@ def video_feed():
 def main():
     global latest_jpeg, stream_active, telemetry, last_status, event_logs, EAR_THRESHOLD, picam, ZOOM_FACTOR, prev_face_center, alert_level
     
-    buzzer = Buzzer(BUZZER_PIN); picam = Picamera2()
+    buzzer = DigitalOutputDevice(BUZZER_PIN, initial_value=not BUZZER_ACTIVE_HIGH)
+    picam = Picamera2()
     threading.Thread(target=beeper_loop, args=(buzzer,), daemon=True).start()
     
     # FORCING 60FPS HARDWARE CONFIG
