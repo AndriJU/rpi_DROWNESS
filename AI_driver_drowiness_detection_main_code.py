@@ -31,7 +31,7 @@ BUZZER_PIN = 17
 BEEP_PULSE_MS = 8.0    # tunable live; a common-emitter stage may need more
 WARN_INTERVAL = 1.00   # one click per second
 CRIT_INTERVAL = 0.12   # rapid clicking
-BUZZER_ACTIVE_HIGH = True   # False if the transistor stage inverts
+BUZZER_ACTIVE_HIGH = False  # transistor stage inverts: GPIO low = sound
 alert_level = "OK"
 test_beep_request = False
 hold_request = False
