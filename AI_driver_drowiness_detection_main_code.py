@@ -50,22 +50,23 @@ cascade_dir = os.path.join(os.path.dirname(__file__), 'cascades')
 face_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_frontalface_default.xml'))
 eye_cascade = cv2.CascadeClassifier(os.path.join(cascade_dir, 'haarcascade_eye.xml'))
 
-def calculate_eye_ratio(eye_region):
-    gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY) if len(eye_region.shape) == 3 else eye_region
-    _, thresh = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY)
-    h, w = thresh.shape
-    top_half = thresh[:h//2, :]
-    bottom_half = thresh[h//2:, :]
-    top_white = np.sum(top_half == 255)
-    bottom_white = np.sum(bottom_half == 255)
-    total_white = top_white + bottom_white
-    return top_white / (total_white + 1)
+def calculate_ear_from_face(face_roi):
+    gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY) if len(face_roi.shape) == 3 else face_roi
+    h, w = gray.shape
+    eye_region = gray[:h//3, :]
+    threshold = cv2.threshold(eye_region, 100, 255, cv2.THRESH_BINARY)[1]
+    dark_pixels = np.sum(threshold == 0)
+    total_pixels = eye_region.size
+    return 1.0 - (dark_pixels / (total_pixels + 1))
 
-def calculate_mouth_ratio(mouth_region):
-    gray = cv2.cvtColor(mouth_region, cv2.COLOR_BGR2GRAY) if len(mouth_region.shape) == 3 else mouth_region
-    _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
-    h, w = thresh.shape
-    return np.sum(thresh == 255) / (h * w + 1)
+def calculate_mar_from_face(face_roi):
+    gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY) if len(face_roi.shape) == 3 else face_roi
+    h, w = gray.shape
+    mouth_region = gray[int(h*0.6):, :]
+    threshold = cv2.threshold(mouth_region, 100, 255, cv2.THRESH_BINARY_INV)[1]
+    dark_pixels = np.sum(threshold > 100)
+    total_pixels = mouth_region.size
+    return dark_pixels / (total_pixels + 1)
 
 def get_pi_temp():
     try:
@@ -261,21 +262,8 @@ def main():
         if len(faces) > 0:
             x, y, fw, fh = faces[0]
             face_roi = frame[y:y+fh, x:x+fw]
-            face_gray = gray[y:y+fh, x:x+fw]
-
-            eyes = eye_cascade.detectMultiScale(face_gray)
-
-            cur_ear = 0.0
-            if len(eyes) >= 2:
-                eye_regions = [face_roi[ey:ey+eh, ex:ex+ew] for ex, ey, ew, eh in eyes[:2]]
-                eye_ratios = [calculate_eye_ratio(eye_reg) for eye_reg in eye_regions]
-                cur_ear = np.mean(eye_ratios)
-
-            cur_mar = 0.0
-            mouth_y_start = int(fh * 0.6)
-            mouth_region = face_roi[mouth_y_start:, :]
-            if mouth_region.size > 0:
-                cur_mar = calculate_mouth_ratio(mouth_region)
+            cur_ear = calculate_ear_from_face(face_roi)
+            cur_mar = calculate_mar_from_face(face_roi)
 
             per_window.append(1 if cur_ear < EAR_THRESHOLD else 0)
             per_score = round((sum(per_window)/len(per_window))*100, 1) if len(per_window)>0 else 0.0
@@ -302,8 +290,7 @@ def main():
             if stream_active:
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 cv2.rectangle(bgr, (x, y), (x+fw, y+fh), (0, 255, 0), 2)
-                for ex, ey, ew, eh in eyes[:2]:
-                    cv2.rectangle(bgr, (x+ex, y+ey), (x+ex+ew, y+ey+eh), (255, 0, 0), 2)
+                cv2.putText(bgr, f"EAR: {cur_ear:.2f} MAR: {cur_mar:.2f}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 _, buf = cv2.imencode('.jpg', bgr); latest_jpeg = buf.tobytes()
         else:
             status = "SEARCHING..."
